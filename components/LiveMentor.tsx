@@ -74,7 +74,8 @@ export const LiveMentor: React.FC = () => {
     
     try {
       // Initialize client inside the handler to ensure fresh instance as per guidelines
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      const apiKey = process.env.API_KEY || '';
+      const ai = new GoogleGenAI({ apiKey });
       
       const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
       const outputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
@@ -107,7 +108,8 @@ export const LiveMentor: React.FC = () => {
             setIsConnecting(false);
           },
           onmessage: async (message: LiveServerMessage) => {
-            const base64Audio = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
+            // Fixed the tsc error by using safe array indexing ?.[0]
+            const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
             if (base64Audio) {
               const outCtx = audioContextRef.current;
               if (outCtx) {
