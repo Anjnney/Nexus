@@ -1,0 +1,8 @@
+{
+  "name": "Nexus - KJSSE Student Companion",
+  "description": "An intelligent AI command center for KJSSE students to manage academics, Mumbai commutes, and placements.",
+  "requestFramePermissions": [
+    "microphone",
+    "geolocation"
+  ]
+}
