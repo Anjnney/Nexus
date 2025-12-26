@@ -1,19 +1,20 @@
 
-import React, { useState, useRef, useCallback } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { GoogleGenAI, Modality, Blob, LiveServerMessage } from '@google/genai';
-import { Mic, MicOff, Loader2, Info } from 'lucide-react';
+import { Mic, MicOff, Loader2, Info, Headphones, Zap } from 'lucide-react';
 
 export const LiveMentor: React.FC = () => {
   const [isActive, setIsActive] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
-  const [transcript, setTranscript] = useState<string[]>([]);
   
   const audioContextRef = useRef<AudioContext | null>(null);
-  const sessionRef = useRef<any>(null);
+  const sessionPromiseRef = useRef<Promise<any> | null>(null);
   const nextStartTimeRef = useRef<number>(0);
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  const inputAudioContextRef = useRef<AudioContext | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
 
-  // Use manual base64 decoding implementation as required.
+  // Manual base64 decoding as required by guidelines
   const decode = (base64: string) => {
     const binaryString = atob(base64);
     const len = binaryString.length;
@@ -24,7 +25,17 @@ export const LiveMentor: React.FC = () => {
     return bytes;
   };
 
-  // Use manual PCM audio data decoding as required.
+  // Manual base64 encoding as required by guidelines
+  const encode = (bytes: Uint8Array) => {
+    let binary = '';
+    const len = bytes.byteLength;
+    for (let i = 0; i < len; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
+  };
+
+  // Raw PCM audio decoding logic as per guidelines
   const decodeAudioData = async (
     data: Uint8Array,
     ctx: AudioContext,
@@ -44,16 +55,7 @@ export const LiveMentor: React.FC = () => {
     return buffer;
   };
 
-  // Use manual base64 encoding implementation as required.
-  const encode = (bytes: Uint8Array) => {
-    let binary = '';
-    const len = bytes.byteLength;
-    for (let i = 0; i < len; i++) {
-      binary += String.fromCharCode(bytes[i]);
-    }
-    return btoa(binary);
-  };
-
+  // Create PCM blob for streaming to the model
   const createBlob = (data: Float32Array): Blob => {
     const l = data.length;
     const int16 = new Int16Array(l);
@@ -67,159 +69,210 @@ export const LiveMentor: React.FC = () => {
   };
 
   const startSession = async () => {
+    if (isConnecting) return;
     setIsConnecting(true);
-    // Initialize GoogleGenAI with apiKey strictly as process.env.API_KEY.
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-
+    
     try {
+      // Initialize client inside the handler to ensure fresh instance as per guidelines
+      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+      
       const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
       const outputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      inputAudioContextRef.current = inputCtx;
       audioContextRef.current = outputCtx;
 
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
 
       const sessionPromise = ai.live.connect({
         model: 'gemini-2.5-flash-native-audio-preview-09-2025',
         callbacks: {
           onopen: () => {
-            console.log('Session opened');
-            setIsActive(true);
-            setIsConnecting(false);
-
+            console.debug('Live API Session Opened');
             const source = inputCtx.createMediaStreamSource(stream);
             const scriptProcessor = inputCtx.createScriptProcessor(4096, 1, 1);
             
             scriptProcessor.onaudioprocess = (e) => {
               const inputData = e.inputBuffer.getChannelData(0);
               const pcmBlob = createBlob(inputData);
-              // Solely rely on sessionPromise resolution for sending input.
-              sessionPromise.then(session => {
+              // CRITICAL: Ensure data is streamed only after the session promise resolves as per guidelines.
+              sessionPromise.then((session) => {
                 session.sendRealtimeInput({ media: pcmBlob });
               });
             };
-
+            
             source.connect(scriptProcessor);
             scriptProcessor.connect(inputCtx.destination);
+            setIsActive(true);
+            setIsConnecting(false);
           },
           onmessage: async (message: LiveServerMessage) => {
-            // Extract audio output bytes from the model's response.
             const base64Audio = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
             if (base64Audio) {
-              const currentCtx = audioContextRef.current!;
-              // Track end of audio playback queue for smooth playback.
-              nextStartTimeRef.current = Math.max(nextStartTimeRef.current, currentCtx.currentTime);
-              const buffer = await decodeAudioData(decode(base64Audio), currentCtx, 24000, 1);
-              const source = currentCtx.createBufferSource();
-              source.buffer = buffer;
-              source.connect(currentCtx.destination);
-              
-              source.addEventListener('ended', () => {
-                sourcesRef.current.delete(source);
-              });
-
-              source.start(nextStartTimeRef.current);
-              nextStartTimeRef.current = nextStartTimeRef.current + buffer.duration;
-              sourcesRef.current.add(source);
+              const outCtx = audioContextRef.current;
+              if (outCtx) {
+                // Schedule each new audio chunk for smooth playback using nextStartTime
+                nextStartTimeRef.current = Math.max(nextStartTimeRef.current, outCtx.currentTime);
+                const audioBuffer = await decodeAudioData(decode(base64Audio), outCtx, 24000, 1);
+                const source = outCtx.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(outCtx.destination);
+                
+                source.onended = () => {
+                  sourcesRef.current.delete(source);
+                };
+                
+                source.start(nextStartTimeRef.current);
+                nextStartTimeRef.current += audioBuffer.duration;
+                sourcesRef.current.add(source);
+              }
             }
 
-            // Handle session interruption by stopping current audio sources.
-            const interrupted = message.serverContent?.interrupted;
-            if (interrupted) {
-              for (const source of sourcesRef.current.values()) {
-                source.stop();
-                sourcesRef.current.delete(source);
-              }
+            if (message.serverContent?.interrupted) {
+              sourcesRef.current.forEach(s => {
+                try { s.stop(); } catch (e) {}
+              });
+              sourcesRef.current.clear();
               nextStartTimeRef.current = 0;
             }
           },
-          onerror: (e) => console.error('Live error:', e),
+          onerror: (e) => {
+            console.error('Live API Error:', e);
+            stopSession();
+          },
           onclose: () => {
-            setIsActive(false);
-            setIsConnecting(false);
+            console.debug('Live API Session Closed');
+            stopSession();
           }
         },
         config: {
-          // Response modalities must contain exactly Modality.AUDIO.
           responseModalities: [Modality.AUDIO],
-          systemInstruction: 'You are a friendly technical mentor for GDG KJSSE TechSprint. Help students with technical questions about Google technologies. Keep your answers brief and encouraging. Speak naturally.',
           speechConfig: {
-            voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }
-          }
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } }
+          },
+          systemInstruction: 'You are Nexus, a helpful AI technical mentor for students at KJSSE (KJ Somaiya College of Engineering). You help with project ideas, syllabus optimization for EXCP/COMPS/IT branches, and career prep. Use a supportive, collegiate tone. Keep responses optimized for natural voice conversation.'
         }
       });
 
-      sessionRef.current = await sessionPromise;
-    } catch (err) {
-      console.error('Failed to start session:', err);
+      sessionPromiseRef.current = sessionPromise;
+
+    } catch (error) {
+      console.error('Failed to start Live Mentor session:', error);
       setIsConnecting(false);
+      setIsActive(false);
     }
   };
 
   const stopSession = () => {
-    if (sessionRef.current) {
-      sessionRef.current.close();
-      sessionRef.current = null;
+    if (sessionPromiseRef.current) {
+      sessionPromiseRef.current.then(s => {
+        try { s.close(); } catch (e) {}
+      });
+      sessionPromiseRef.current = null;
     }
+    
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+
+    if (inputAudioContextRef.current) {
+      inputAudioContextRef.current.close().catch(() => {});
+      inputAudioContextRef.current = null;
+    }
+
+    if (audioContextRef.current) {
+      audioContextRef.current.close().catch(() => {});
+      audioContextRef.current = null;
+    }
+
+    sourcesRef.current.forEach(s => {
+      try { s.stop(); } catch (e) {}
+    });
+    sourcesRef.current.clear();
+    nextStartTimeRef.current = 0;
+
     setIsActive(false);
+    setIsConnecting(false);
   };
 
+  useEffect(() => {
+    return () => stopSession();
+  }, []);
+
   return (
-    <div className="max-w-3xl mx-auto flex flex-col items-center justify-center space-y-12 py-12">
-      <div className="text-center space-y-4">
-        <h2 className="text-4xl font-product font-bold text-gray-900">Live AI Mentor</h2>
-        <p className="text-gray-500 max-w-md mx-auto">
-          Talk in real-time with a Gemini-powered mentor to debug code or brainstorm architectures.
-        </p>
-      </div>
+    <div className="max-w-4xl mx-auto space-y-8 animate-in fade-in duration-500">
+      <div className="bg-white p-10 rounded-[3rem] shadow-xl border border-gray-100 text-center space-y-8 relative overflow-hidden">
+        <div className="relative z-10">
+          <div className={`w-24 h-24 mx-auto rounded-full flex items-center justify-center transition-all duration-500 ${isActive ? 'bg-red-500 animate-pulse scale-110 shadow-2xl shadow-red-200' : 'bg-gray-100 text-gray-400'}`}>
+            {isActive ? <Mic className="w-10 h-10 text-white" /> : <MicOff className="w-10 h-10" />}
+          </div>
+          
+          <div className="mt-8">
+            <h2 className="text-3xl font-product font-bold text-gray-900">AI Voice Mentor</h2>
+            <p className="text-gray-500 mt-2 max-w-md mx-auto">
+              Discuss your TechSprint ideas or EXCP projects in real-time. Natural, low-latency conversation powered by Gemini Live.
+            </p>
+          </div>
 
-      <div className="relative group">
-        {/* Pulsing effect when active */}
-        {isActive && (
-          <div className="absolute inset-0 animate-ping rounded-full bg-blue-400/20" />
-        )}
-        
-        <button
-          onClick={isActive ? stopSession : startSession}
-          disabled={isConnecting}
-          className={`relative z-10 w-48 h-48 rounded-full flex flex-col items-center justify-center transition-all shadow-2xl ${
-            isActive 
-              ? 'bg-red-500 hover:bg-red-600 scale-105' 
-              : 'bg-blue-600 hover:bg-blue-700 hover:scale-105'
-          } ${isConnecting ? 'opacity-50 cursor-not-allowed' : ''}`}
-        >
-          {isConnecting ? (
-            <Loader2 className="w-16 h-16 text-white animate-spin" />
-          ) : isActive ? (
-            <>
-              <MicOff className="w-16 h-16 text-white mb-2" />
-              <span className="text-white font-bold">End Session</span>
-            </>
-          ) : (
-            <>
-              <Mic className="w-16 h-16 text-white mb-2" />
-              <span className="text-white font-bold">Start Talking</span>
-            </>
-          )}
-        </button>
+          <div className="flex flex-col items-center space-y-4 pt-4">
+            {!isActive ? (
+              <button
+                onClick={startSession}
+                disabled={isConnecting}
+                className="bg-[#B22222] text-white px-10 py-4 rounded-2xl font-bold flex items-center space-x-3 hover:bg-[#800000] transition-all shadow-xl shadow-red-100 disabled:opacity-50"
+              >
+                {isConnecting ? <Loader2 className="w-5 h-5 animate-spin" /> : <Zap className="w-5 h-5" />}
+                <span>{isConnecting ? 'Initializing...' : 'Start Voice Consultation'}</span>
+              </button>
+            ) : (
+              <button
+                onClick={stopSession}
+                className="bg-red-50 text-red-600 px-10 py-4 rounded-2xl font-bold flex items-center space-x-3 hover:bg-red-100 transition-all border border-red-100"
+              >
+                <MicOff className="w-5 h-5" />
+                <span>End Session</span>
+              </button>
+            )}
+          </div>
+        </div>
 
         {isActive && (
-          <div className="absolute -bottom-12 left-1/2 -translate-x-1/2 flex items-center space-x-2">
-            <div className="flex space-x-1 h-4 items-end">
-              <div className="w-1 bg-blue-500 rounded-full animate-[bounce_1s_infinite]" />
-              <div className="w-1 bg-blue-500 rounded-full animate-[bounce_1.2s_infinite]" />
-              <div className="w-1 bg-blue-500 rounded-full animate-[bounce_0.8s_infinite]" />
-              <div className="w-1 bg-blue-500 rounded-full animate-[bounce_1.1s_infinite]" />
+          <div className="flex items-center justify-center space-x-4 animate-in fade-in duration-700">
+            <div className="flex space-x-1">
+              {[1, 2, 3, 4, 5].map((i) => (
+                <div key={i} className="w-1 h-6 bg-red-400 rounded-full animate-bounce" style={{ animationDelay: `${i * 0.1}s` }} />
+              ))}
             </div>
-            <span className="text-blue-600 font-semibold text-sm">AI is listening...</span>
+            <span className="text-sm font-bold text-red-500 uppercase tracking-widest">Live Connection Active</span>
           </div>
         )}
+
+        {/* Decorative elements */}
+        <div className="absolute top-0 right-0 w-64 h-64 bg-red-400/5 rounded-full blur-3xl -mr-32 -mt-32" />
+        <div className="absolute bottom-0 left-0 w-48 h-48 bg-blue-400/5 rounded-full blur-3xl -ml-24 -mb-24" />
       </div>
 
-      <div className="bg-blue-50 border border-blue-100 p-4 rounded-2xl flex items-start space-x-3 max-w-md">
-        <Info className="w-5 h-5 text-blue-600 shrink-0 mt-0.5" />
-        <p className="text-sm text-blue-800">
-          <strong>Tip:</strong> Ask things like "How do I integrate Firebase Auth?" or "Can you explain Gemini's multi-modal capabilities?"
-        </p>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div className="bg-blue-50 p-8 rounded-[2.5rem] border border-blue-100 flex items-start space-x-4">
+          <div className="p-3 bg-white rounded-2xl text-blue-600 shadow-sm">
+            <Headphones className="w-6 h-6" />
+          </div>
+          <div>
+            <h4 className="font-bold text-blue-900 mb-1">Ultra-Low Latency</h4>
+            <p className="text-sm text-blue-700/70 leading-relaxed">Powered by Gemini 2.5 Flash Native Audio for human-like response speeds.</p>
+          </div>
+        </div>
+
+        <div className="bg-purple-50 p-8 rounded-[2.5rem] border border-purple-100 flex items-start space-x-4">
+          <div className="p-3 bg-white rounded-2xl text-purple-600 shadow-sm">
+            <Info className="w-6 h-6" />
+          </div>
+          <div>
+            <h4 className="font-bold text-purple-900 mb-1">Commuter Friendly</h4>
+            <p className="text-sm text-purple-700/70 leading-relaxed">Perfect for brain-storming during your Mumbai Local commute to Vidyavihar.</p>
+          </div>
+        </div>
       </div>
     </div>
   );

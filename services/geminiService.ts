@@ -1,8 +1,17 @@
+import { GoogleGenAI } from "@google/genai";
 
-import { GoogleGenAI, Type } from "@google/genai";
+declare global {
+  namespace NodeJS {
+    interface ProcessEnv {
+      API_KEY: string;
+    }
+  }
+}
 
 const getAIClient = () => {
-  return new GoogleGenAI({ apiKey: process.env.API_KEY });
+  const apiKey = process.env.API_KEY;
+  if (!apiKey) throw new Error("API_KEY environment variable is not defined");
+  return new GoogleGenAI({ apiKey });
 };
 
 export const getTransitUpdate = async (query: string): Promise<{ text: string, sources: any[] }> => {
@@ -158,11 +167,14 @@ export const generateAppLogo = async (prompt: string): Promise<string> => {
     }
   });
 
-  for (const part of response.candidates[0].content.parts) {
-    if (part.inlineData) {
-      const base64Data = part.inlineData.data;
-      const mimeType = part.inlineData.mimeType || 'image/png';
-      return `data:${mimeType};base64,${base64Data}`;
+  const parts = response.candidates?.[0]?.content?.parts;
+  if (parts) {
+    for (const part of parts) {
+      if (part.inlineData) {
+        const base64Data = part.inlineData.data;
+        const mimeType = part.inlineData.mimeType || 'image/png';
+        return `data:${mimeType};base64,${base64Data}`;
+      }
     }
   }
 
